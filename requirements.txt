@@ -1,0 +1,5 @@
+earthengine-api>=0.1.400
+imageio>=2.34.0
+numpy>=1.26.0
+Pillow>=10.0.0
+requests>=2.31.0
