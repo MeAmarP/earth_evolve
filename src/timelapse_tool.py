@@ -1,56 +1,41 @@
 #!/usr/bin/env python3
-"""Build a yearly satellite timelapse GIF for a lat/lon AOI."""
+"""Build a yearly satellite timelapse GIF from public STAC data."""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
-import io
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-import ee
 import imageio.v2 as imageio
 import numpy as np
-import requests
+import stackstac
 from PIL import Image, ImageDraw, ImageFont
+from pystac import Item
+from pystac_client import Client
 
+# Configure GDAL/rasterio to access public S3 data without AWS credentials
+os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "YES"
+os.environ["CPL_VSIL_CURL_ALLOWED_EXTENSIONS"] = ".tif"
+os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
 
 CURRENT_YEAR = dt.datetime.utcnow().year
-
-LANDSAT_SOURCES: list[dict[str, Any]] = [
-    {
-        "id": "LANDSAT/LT05/C02/T1_L2",
-        "start_year": 1984,
-        "end_year": 2012,
-        "bands": ["SR_B1", "SR_B2", "SR_B3", "SR_B4"],
-    },
-    {
-        "id": "LANDSAT/LE07/C02/T1_L2",
-        "start_year": 1999,
-        "end_year": CURRENT_YEAR,
-        "bands": ["SR_B1", "SR_B2", "SR_B3", "SR_B4"],
-    },
-    {
-        "id": "LANDSAT/LC08/C02/T1_L2",
-        "start_year": 2013,
-        "end_year": CURRENT_YEAR,
-        "bands": ["SR_B2", "SR_B3", "SR_B4", "SR_B5"],
-    },
-    {
-        "id": "LANDSAT/LC09/C02/T1_L2",
-        "start_year": 2021,
-        "end_year": CURRENT_YEAR,
-        "bands": ["SR_B2", "SR_B3", "SR_B4", "SR_B5"],
-    },
-]
+STAC_API_DEFAULT = "https://earth-search.aws.element84.com/v1"
+SENSOR_TO_COLLECTION = {
+    "landsat": "landsat-c2-l2",
+    "sentinel2": "sentinel-2-l2a",
+}
 
 
 @dataclass
 class Config:
+    """Validated runtime configuration shared across the pipeline."""
+
     start_year: int
     end_year: int
     sensor: str
@@ -62,13 +47,17 @@ class Config:
     name: str
     export_frames: bool
     make_mp4: bool
-    ee_project: str | None
     bbox: tuple[float, float, float, float]
+    stac_api: str
+    max_items_per_year: int
+    composite_items: int
 
 
 def parse_args() -> argparse.Namespace:
+    """Define the CLI and return parsed arguments."""
+
     parser = argparse.ArgumentParser(
-        description="Generate a yearly satellite timelapse GIF from Earth Engine."
+        description="Generate a yearly satellite timelapse GIF from public STAC collections."
     )
     parser.add_argument("--lat", type=float, help="Latitude of center point.")
     parser.add_argument("--lon", type=float, help="Longitude of center point.")
@@ -89,7 +78,7 @@ def parse_args() -> argparse.Namespace:
         "--sensor",
         choices=["landsat", "sentinel2"],
         default="landsat",
-        help="landsat supports long history; sentinel2 starts in 2015.",
+        help="landsat supports longer history; sentinel2 has modern coverage.",
     )
     parser.add_argument(
         "--viz",
@@ -100,13 +89,13 @@ def parse_args() -> argparse.Namespace:
         "--cloud-threshold",
         type=int,
         default=30,
-        help="Cloud percent threshold metadata filter.",
+        help="Cloud percent threshold filter (eo:cloud_cover <= value).",
     )
     parser.add_argument(
         "--frame-size",
         type=int,
         default=768,
-        help="Square frame size in px (max 1024).",
+        help="Maximum frame dimension in px (max 1024).",
     )
     parser.add_argument("--fps", type=float, default=2.0)
     parser.add_argument("--output-dir", type=Path, default=Path("output"))
@@ -122,14 +111,29 @@ def parse_args() -> argparse.Namespace:
         help="Also attempt MP4 export using imageio ffmpeg plugin.",
     )
     parser.add_argument(
-        "--ee-project",
+        "--stac-api",
         type=str,
-        help="Optional Google Cloud project for Earth Engine initialization.",
+        default=STAC_API_DEFAULT,
+        help=f"STAC API endpoint (default: {STAC_API_DEFAULT}).",
+    )
+    parser.add_argument(
+        "--max-items-per-year",
+        type=int,
+        default=120,
+        help="Maximum STAC items fetched per year before filtering.",
+    )
+    parser.add_argument(
+        "--composite-items",
+        type=int,
+        default=40,
+        help="Top N least-cloudy items used for yearly composite.",
     )
     return parser.parse_args()
 
 
 def latlon_radius_to_bbox(lat: float, lon: float, radius_km: float) -> tuple[float, float, float, float]:
+    """Approximate a square lon/lat bounding box around a center point."""
+
     lat_deg = radius_km / 110.574
     lon_deg = radius_km / (111.320 * max(math.cos(math.radians(lat)), 1e-6))
     west, east = lon - lon_deg, lon + lon_deg
@@ -138,6 +142,8 @@ def latlon_radius_to_bbox(lat: float, lon: float, radius_km: float) -> tuple[flo
 
 
 def parse_bbox(bbox_str: str) -> tuple[float, float, float, float]:
+    """Parse a `west,south,east,north` string into numeric bounds."""
+
     raw = [x.strip() for x in bbox_str.split(",")]
     if len(raw) != 4:
         raise ValueError("bbox must be west,south,east,north")
@@ -148,12 +154,14 @@ def parse_bbox(bbox_str: str) -> tuple[float, float, float, float]:
 
 
 def build_config(args: argparse.Namespace) -> Config:
+    """Validate CLI input and normalize it into a Config object."""
+
     if args.start_year > args.end_year:
         raise ValueError("start-year must be <= end-year")
     if args.end_year > CURRENT_YEAR:
         raise ValueError(f"end-year must be <= {CURRENT_YEAR}")
     if args.start_year < 1984:
-        raise ValueError("start-year must be >= 1984 for available datasets")
+        raise ValueError("start-year must be >= 1984 for Landsat history")
     if args.sensor == "sentinel2" and args.start_year < 2015:
         raise ValueError("sentinel2 only supports years >= 2015")
     if args.frame_size < 128 or args.frame_size > 1024:
@@ -162,6 +170,13 @@ def build_config(args: argparse.Namespace) -> Config:
         raise ValueError("fps must be > 0")
     if args.cloud_threshold < 0 or args.cloud_threshold > 100:
         raise ValueError("cloud-threshold must be between 0 and 100")
+    if args.max_items_per_year <= 0:
+        raise ValueError("max-items-per-year must be > 0")
+    if args.composite_items <= 0:
+        raise ValueError("composite-items must be > 0")
+    if args.composite_items > args.max_items_per_year:
+        raise ValueError("composite-items must be <= max-items-per-year")
+
     if args.bbox:
         bbox = parse_bbox(args.bbox)
     else:
@@ -170,6 +185,7 @@ def build_config(args: argparse.Namespace) -> Config:
         if args.radius_km <= 0:
             raise ValueError("radius-km must be positive")
         bbox = latlon_radius_to_bbox(args.lat, args.lon, args.radius_km)
+
     return Config(
         start_year=args.start_year,
         end_year=args.end_year,
@@ -182,118 +198,192 @@ def build_config(args: argparse.Namespace) -> Config:
         name=args.name,
         export_frames=args.export_frames,
         make_mp4=args.mp4,
-        ee_project=args.ee_project,
         bbox=bbox,
+        stac_api=args.stac_api,
+        max_items_per_year=args.max_items_per_year,
+        composite_items=args.composite_items,
     )
 
 
-def init_earth_engine(project: str | None) -> None:
-    try:
-        if project:
-            ee.Initialize(project=project)
-        else:
-            ee.Initialize()
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(
-            "Failed to initialize Earth Engine. Run `earthengine authenticate` first "
-            "and pass --ee-project if required."
-        ) from exc
+def query_items(config: Config, client: Client, year: int) -> list[Item]:
+    """Fetch and sort STAC items for one year by increasing cloud cover."""
 
-
-def landsat_mask_and_scale(input_bands: list[str]) -> Callable[[ee.Image], ee.Image]:
-    def _fn(image: ee.Image) -> ee.Image:
-        qa = image.select("QA_PIXEL")
-        mask = (
-            qa.bitwiseAnd(1 << 1).eq(0)  # Dilated cloud
-            .And(qa.bitwiseAnd(1 << 3).eq(0))  # Cloud
-            .And(qa.bitwiseAnd(1 << 4).eq(0))  # Cloud shadow
-            .And(qa.bitwiseAnd(1 << 5).eq(0))  # Snow
-        )
-        scaled = (
-            image.select(input_bands, ["blue", "green", "red", "nir"])
-            .multiply(0.0000275)
-            .add(-0.2)
-        )
-        return scaled.updateMask(mask).copyProperties(image, image.propertyNames())
-
-    return _fn
-
-
-def sentinel2_mask_and_scale(image: ee.Image) -> ee.Image:
-    scl = image.select("SCL")
-    mask = (
-        scl.neq(1)  # Saturated/defective
-        .And(scl.neq(3))  # Cloud shadow
-        .And(scl.neq(8))  # Medium probability cloud
-        .And(scl.neq(9))  # High probability cloud
-        .And(scl.neq(10))  # Thin cirrus
-        .And(scl.neq(11))  # Snow/Ice
+    collection_id = SENSOR_TO_COLLECTION[config.sensor]
+    start = f"{year}-01-01T00:00:00Z"
+    end = f"{year}-12-31T23:59:59Z"
+    search = client.search(
+        collections=[collection_id],
+        bbox=list(config.bbox),
+        datetime=f"{start}/{end}",
+        query={"eo:cloud_cover": {"lte": config.cloud_threshold}},
+        max_items=config.max_items_per_year,
     )
-    scaled = image.select(["B2", "B3", "B4", "B8"], ["blue", "green", "red", "nir"]).divide(10000)
-    return scaled.updateMask(mask).copyProperties(image, image.propertyNames())
-
-
-def get_year_collection(config: Config, year: int, aoi: ee.Geometry) -> tuple[ee.ImageCollection, list[str]]:
-    start = f"{year}-01-01"
-    end = f"{year + 1}-01-01"
-    if config.sensor == "sentinel2":
-        coll = (
-            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-            .filterBounds(aoi)
-            .filterDate(start, end)
-            .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", config.cloud_threshold))
-            .map(sentinel2_mask_and_scale)
+    items = list(search.items())
+    items.sort(
+        key=lambda it: (
+            float(it.properties.get("eo:cloud_cover", 1000.0)),
+            str(it.datetime or ""),
         )
-        return coll, ["COPERNICUS/S2_SR_HARMONIZED"]
-
-    merged: ee.ImageCollection | None = None
-    datasets: list[str] = []
-    for source in LANDSAT_SOURCES:
-        if not (source["start_year"] <= year <= source["end_year"]):
-            continue
-        datasets.append(source["id"])
-        coll = (
-            ee.ImageCollection(source["id"])
-            .filterBounds(aoi)
-            .filterDate(start, end)
-            .filter(ee.Filter.lte("CLOUD_COVER", config.cloud_threshold))
-            .map(landsat_mask_and_scale(source["bands"]))
-        )
-        merged = coll if merged is None else merged.merge(coll)
-
-    if merged is None:
-        merged = ee.ImageCollection([])
-    return merged, datasets
-
-
-def apply_viz(image: ee.Image, viz: str) -> ee.Image:
-    if viz == "true_color":
-        return image.select(["red", "green", "blue"]).visualize(min=0.02, max=0.35, gamma=1.2)
-    if viz == "false_color":
-        return image.select(["nir", "red", "green"]).visualize(min=0.02, max=0.45, gamma=1.2)
-    ndvi = image.normalizedDifference(["nir", "red"]).rename("ndvi")
-    return ndvi.visualize(
-        min=-0.2,
-        max=0.8,
-        palette=["#8c510a", "#f6e8c3", "#1b7837"],
     )
+    return items[: config.composite_items]
 
 
-def fetch_png_bytes(image: ee.Image, region: dict[str, Any], frame_size: int) -> bytes:
-    url = image.getThumbURL(
-        {
-            "region": region,
-            "dimensions": f"{frame_size}x{frame_size}",
-            "format": "png",
-        }
+def pick_band_key(items: list[Item], candidates: list[str]) -> str | None:
+    """Find the first asset key matching one of the requested band aliases."""
+
+    lower_candidates = [c.lower() for c in candidates]
+    for item in items[: min(len(items), 10)]:
+        for key, asset in item.assets.items():
+            key_l = key.lower()
+            if key_l in lower_candidates:
+                return key
+            eo_bands = asset.extra_fields.get("eo:bands")
+            if isinstance(eo_bands, list):
+                for band in eo_bands:
+                    if isinstance(band, dict):
+                        common_name = str(band.get("common_name", "")).lower()
+                        name = str(band.get("name", "")).lower()
+                        if common_name in lower_candidates or name in lower_candidates:
+                            return key
+    return None
+
+
+def resolve_asset_keys(items: list[Item], sensor: str) -> dict[str, str]:
+    """Map logical band names (`blue/green/red/nir`) to collection asset keys."""
+
+    if sensor == "sentinel2":
+        blue = pick_band_key(items, ["blue", "b02"])
+        green = pick_band_key(items, ["green", "b03"])
+        red = pick_band_key(items, ["red", "b04"])
+        nir = pick_band_key(items, ["nir", "nir08", "b08"])
+    else:
+        blue = pick_band_key(items, ["blue", "sr_b2", "sr_b1"])
+        green = pick_band_key(items, ["green", "sr_b3", "sr_b2"])
+        red = pick_band_key(items, ["red", "sr_b4", "sr_b3"])
+        nir = pick_band_key(items, ["nir", "nir08", "sr_b5", "sr_b4"])
+
+    if not all([blue, green, red, nir]):
+        raise RuntimeError("Could not map required RGB/NIR assets for selected collection.")
+    return {"blue": blue, "green": green, "red": red, "nir": nir}
+
+
+def filter_items_with_assets(items: list[Item], asset_keys: dict[str, str]) -> list[Item]:
+    """Drop STAC items that do not expose every required band asset."""
+
+    required = list(asset_keys.values())
+    filtered = [item for item in items if all(k in item.assets for k in required)]
+    return filtered
+
+
+def target_resolution_meters(bbox: tuple[float, float, float, float], frame_size: int, sensor: str) -> float:
+    """Estimate output pixel size in meters, respecting native sensor resolution."""
+
+    west, south, east, north = bbox
+    lat_mid = (south + north) / 2
+    width_m = abs(east - west) * 111_320 * max(math.cos(math.radians(lat_mid)), 1e-6)
+    height_m = abs(north - south) * 110_574
+    max_span = max(width_m, height_m)
+    approx_resolution = max_span / frame_size
+    native = 10.0 if sensor == "sentinel2" else 30.0
+    return max(native, approx_resolution)
+
+
+def fetch_year_composite(
+    config: Config,
+    items: list[Item],
+    asset_keys: dict[str, str],
+    resolution_m: float,
+) -> np.ndarray:
+    """Read selected scenes, stack RGB+NIR bands, and build a yearly median composite."""
+
+    usable_items = filter_items_with_assets(items, asset_keys)
+    if not usable_items:
+        raise RuntimeError("No items contain all required RGB/NIR assets.")
+
+    ordered_assets = [
+        asset_keys["blue"],
+        asset_keys["green"],
+        asset_keys["red"],
+        asset_keys["nir"],
+    ]
+    data = stackstac.stack(
+        usable_items,
+        assets=ordered_assets,
+        bounds_latlon=config.bbox,
+        epsg=3857,
+        resolution=resolution_m,
+        fill_value=np.nan,
+        rescale=True,
     )
-    response = requests.get(url, timeout=180)
-    response.raise_for_status()
-    return response.content
+    arr = data.transpose("time", "band", "y", "x").astype("float32").compute().values
+    if arr.size == 0:
+        raise RuntimeError("Composite array is empty after stacking.")
+    with np.errstate(invalid="ignore"):
+        composite = np.nanmedian(arr, axis=0)
+    if not np.isfinite(composite).any():
+        raise RuntimeError("Composite contains only nodata pixels.")
+    return composite
 
 
-def annotate_frame(frame_bytes: bytes, year: int) -> np.ndarray:
-    image = Image.open(io.BytesIO(frame_bytes)).convert("RGBA")
+def robust_min_max(values: np.ndarray, low_pct: float = 2.0, high_pct: float = 98.0) -> tuple[float, float]:
+    """Return percentile-based display bounds while ignoring nodata values."""
+
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    lo = float(np.percentile(finite, low_pct))
+    hi = float(np.percentile(finite, high_pct))
+    if hi <= lo:
+        hi = lo + 1e-6
+    return lo, hi
+
+
+def normalize(values: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Scale values into the `[0, 1]` display range and clamp outliers."""
+
+    scaled = (values - lo) / (hi - lo)
+    return np.clip(scaled, 0.0, 1.0)
+
+
+def hex_to_rgb(color: str) -> tuple[int, int, int]:
+    """Convert a hex color string into an RGB tuple."""
+
+    color = color.lstrip("#")
+    return int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
+
+
+def ndvi_to_rgb(ndvi: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Colorize NDVI values using a simple brown-to-green gradient."""
+
+    palette = [hex_to_rgb("#8c510a"), hex_to_rgb("#f6e8c3"), hex_to_rgb("#1b7837")]
+    x = normalize(ndvi, lo, hi)
+    xp = np.array([0.0, 0.5, 1.0], dtype=np.float32)
+    red = np.interp(x, xp, [palette[0][0], palette[1][0], palette[2][0]])
+    green = np.interp(x, xp, [palette[0][1], palette[1][1], palette[2][1]])
+    blue = np.interp(x, xp, [palette[0][2], palette[1][2], palette[2][2]])
+    return np.stack([red, green, blue], axis=-1).astype(np.uint8)
+
+
+def letterbox_to_square(frame: np.ndarray, size: int) -> np.ndarray:
+    """Resize a frame into a square canvas without distorting aspect ratio."""
+
+    image = Image.fromarray(frame, mode="RGB")
+    width, height = image.size
+    scale = min(size / width, size / height)
+    new_w = max(1, int(width * scale))
+    new_h = max(1, int(height * scale))
+    resized = image.resize((new_w, new_h), resample=Image.Resampling.BILINEAR)
+    canvas = Image.new("RGB", (size, size), color=(20, 20, 20))
+    x = (size - new_w) // 2
+    y = (size - new_h) // 2
+    canvas.paste(resized, (x, y))
+    return np.asarray(canvas)
+
+
+def annotate_frame(frame: np.ndarray, year: int) -> np.ndarray:
+    """Overlay the frame year in the top-left corner."""
+
+    image = Image.fromarray(frame, mode="RGB").convert("RGBA")
     draw = ImageDraw.Draw(image, "RGBA")
     text = str(year)
     font = ImageFont.load_default()
@@ -309,6 +399,8 @@ def annotate_frame(frame_bytes: bytes, year: int) -> np.ndarray:
 
 
 def make_placeholder_frame(year: int, frame_size: int, message: str) -> np.ndarray:
+    """Create a fallback frame when imagery is missing or processing fails."""
+
     image = Image.new("RGB", (frame_size, frame_size), color=(30, 30, 30))
     draw = ImageDraw.Draw(image)
     font = ImageFont.load_default()
@@ -326,33 +418,118 @@ def make_placeholder_frame(year: int, frame_size: int, message: str) -> np.ndarr
     return np.asarray(image)
 
 
-def build_region_geojson(bbox: tuple[float, float, float, float]) -> dict[str, Any]:
-    west, south, east, north = bbox
-    return {
-        "type": "Polygon",
-        "coordinates": [[[west, south], [east, south], [east, north], [west, north], [west, south]]],
+def compute_global_stats(composites: list[np.ndarray | None]) -> dict[str, tuple[float, float]]:
+    """Derive shared normalization ranges so all frames use a consistent scale."""
+
+    valid = [c for c in composites if c is not None]
+    if not valid:
+        return {
+            "blue": (0.0, 1.0),
+            "green": (0.0, 1.0),
+            "red": (0.0, 1.0),
+            "nir": (0.0, 1.0),
+            "ndvi": (-0.2, 0.8),
+        }
+    stack = np.stack(valid, axis=0)
+    stats = {
+        "blue": robust_min_max(stack[:, 0, :, :]),
+        "green": robust_min_max(stack[:, 1, :, :]),
+        "red": robust_min_max(stack[:, 2, :, :]),
+        "nir": robust_min_max(stack[:, 3, :, :]),
     }
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ndvi = (stack[:, 3, :, :] - stack[:, 2, :, :]) / (stack[:, 3, :, :] + stack[:, 2, :, :] + 1e-6)
+    ndvi_lo, ndvi_hi = robust_min_max(ndvi)
+    stats["ndvi"] = (max(-1.0, ndvi_lo), min(1.0, ndvi_hi))
+    return stats
+
+
+def render_composite(composite: np.ndarray, viz: str, stats: dict[str, tuple[float, float]]) -> np.ndarray:
+    """Render a composite into an RGB frame for the chosen visualization preset."""
+
+    blue, green, red, nir = composite
+    if viz == "true_color":
+        r = normalize(red, *stats["red"])
+        g = normalize(green, *stats["green"])
+        b = normalize(blue, *stats["blue"])
+        rgb = np.stack([r, g, b], axis=-1)
+        return (rgb * 255).astype(np.uint8)
+    if viz == "false_color":
+        r = normalize(nir, *stats["nir"])
+        g = normalize(red, *stats["red"])
+        b = normalize(green, *stats["green"])
+        rgb = np.stack([r, g, b], axis=-1)
+        return (rgb * 255).astype(np.uint8)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ndvi = (nir - red) / (nir + red + 1e-6)
+    return ndvi_to_rgb(ndvi, *stats["ndvi"])
 
 
 def render_timelapse(config: Config) -> None:
+    """Run the full workflow: query imagery, build frames, and write outputs."""
+
     output_dir = config.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     frames_dir = output_dir / "frames"
     if config.export_frames:
         frames_dir.mkdir(parents=True, exist_ok=True)
 
-    west, south, east, north = config.bbox
-    aoi = ee.Geometry.Rectangle([west, south, east, north], proj="EPSG:4326", geodesic=False)
-    region = build_region_geojson(config.bbox)
+    client = Client.open(config.stac_api)
+    resolution_m = target_resolution_meters(config.bbox, config.frame_size, config.sensor)
 
+    frame_records: list[dict[str, Any]] = []
+    composites: list[np.ndarray | None] = []
+
+    for year in range(config.start_year, config.end_year + 1):
+        print(f"Fetching imagery for {year}...")
+        frame_meta: dict[str, Any] = {"year": year, "collection": SENSOR_TO_COLLECTION[config.sensor]}
+        try:
+            items = query_items(config, client, year)
+            frame_meta["image_count"] = len(items)
+            if not items:
+                composites.append(None)
+                frame_meta["status"] = "no_data"
+                frame_records.append(frame_meta)
+                continue
+            asset_keys = resolve_asset_keys(items, config.sensor)
+            frame_meta["assets"] = asset_keys
+            composite = fetch_year_composite(config, items, asset_keys, resolution_m)
+            composites.append(composite)
+            frame_meta["status"] = "ok"
+        except Exception as exc:
+            composites.append(None)
+            frame_meta["status"] = "error"
+            frame_meta["error"] = str(exc)
+        frame_records.append(frame_meta)
+
+    stats = compute_global_stats(composites)
     frames: list[np.ndarray] = []
+    for idx, year in enumerate(range(config.start_year, config.end_year + 1)):
+        composite = composites[idx]
+        if composite is None:
+            status = frame_records[idx].get("status", "error")
+            msg = "No imagery" if status == "no_data" else "Frame error"
+            frame = make_placeholder_frame(year, config.frame_size, msg)
+        else:
+            rendered = render_composite(composite, config.viz, stats)
+            squared = letterbox_to_square(rendered, config.frame_size)
+            frame = annotate_frame(squared, year)
+        frames.append(frame)
+        if config.export_frames:
+            imageio.imwrite(frames_dir / f"{year}.png", frame)
+
+    gif_path = output_dir / f"{config.name}.gif"
+    imageio.mimsave(gif_path, frames, duration=1.0 / config.fps, loop=0)
+
     metadata: dict[str, Any] = {
         "generated_at_utc": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "stac_api": config.stac_api,
+        "collection": SENSOR_TO_COLLECTION[config.sensor],
         "bbox": {
-            "west": west,
-            "south": south,
-            "east": east,
-            "north": north,
+            "west": config.bbox[0],
+            "south": config.bbox[1],
+            "east": config.bbox[2],
+            "north": config.bbox[3],
         },
         "start_year": config.start_year,
         "end_year": config.end_year,
@@ -361,38 +538,14 @@ def render_timelapse(config: Config) -> None:
         "cloud_threshold": config.cloud_threshold,
         "frame_size": config.frame_size,
         "fps": config.fps,
-        "frames": [],
+        "max_items_per_year": config.max_items_per_year,
+        "composite_items": config.composite_items,
+        "resolution_meters": resolution_m,
+        "normalization_stats": {
+            key: {"min": value[0], "max": value[1]} for key, value in stats.items()
+        },
+        "frames": frame_records,
     }
-
-    for year in range(config.start_year, config.end_year + 1):
-        print(f"Building frame {year}...")
-        frame_meta: dict[str, Any] = {"year": year}
-        try:
-            collection, datasets = get_year_collection(config, year, aoi)
-            count = int(collection.size().getInfo())
-            frame_meta["image_count"] = count
-            frame_meta["datasets"] = datasets
-            if count == 0:
-                frame = make_placeholder_frame(year, config.frame_size, "No imagery")
-                frame_meta["status"] = "no_data"
-            else:
-                composite = collection.median().clip(aoi)
-                vis = apply_viz(composite, config.viz)
-                frame_bytes = fetch_png_bytes(vis, region, config.frame_size)
-                frame = annotate_frame(frame_bytes, year)
-                frame_meta["status"] = "ok"
-        except Exception as exc:
-            frame = make_placeholder_frame(year, config.frame_size, "Frame error")
-            frame_meta["status"] = "error"
-            frame_meta["error"] = str(exc)
-
-        frames.append(frame)
-        metadata["frames"].append(frame_meta)
-        if config.export_frames:
-            imageio.imwrite(frames_dir / f"{year}.png", frame)
-
-    gif_path = output_dir / f"{config.name}.gif"
-    imageio.mimsave(gif_path, frames, duration=1.0 / config.fps, loop=0)
 
     if config.make_mp4:
         mp4_path = output_dir / f"{config.name}.mp4"
@@ -415,12 +568,13 @@ def render_timelapse(config: Config) -> None:
 
 
 def main() -> None:
+    """CLI entry point."""
+
     args = parse_args()
     try:
         config = build_config(args)
     except ValueError as exc:
         raise SystemExit(f"Input error: {exc}") from exc
-    init_earth_engine(config.ee_project)
     render_timelapse(config)
 
 
