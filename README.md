@@ -1,6 +1,7 @@
-# Satellite Timelapse GIF Tool
+# Satellite Timelapse GIF Tool (No Signup)
 
-Build a yearly satellite timelapse GIF for a location over 10-20 years using Google Earth Engine.
+Build a yearly satellite timelapse GIF for a location over 10-20 years using public STAC data (Earth Search on AWS Open Data).  
+No Google Earth Engine account is required.
 
 ## Features
 
@@ -9,38 +10,39 @@ Build a yearly satellite timelapse GIF for a location over 10-20 years using Goo
   - or `--bbox west,south,east,north`
 - Time range by year (`--start-year`, `--end-year`)
 - Sensor presets:
-  - `landsat` (long history, good for 10-20 years)
-  - `sentinel2` (2015+)
+  - `landsat` (best for long history)
+  - `sentinel2` (modern years, best detail)
 - Visualization presets:
   - `true_color`
   - `false_color`
   - `ndvi`
-- Outputs:
+- Output artifacts:
   - `*.gif`
   - optional `frames/*.png`
   - `metadata.json`
   - optional `*.mp4`
 
+## Data Source
+
+- Default STAC API: `https://earth-search.aws.element84.com/v1`
+- Collection mapping:
+  - `landsat` -> `landsat-c2-l2`
+  - `sentinel2` -> `sentinel-2-l2a`
+
 ## Setup
 
-1. Create and activate a virtual environment.
+1. Create and activate virtualenv.
 2. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Authenticate Earth Engine:
-
-```bash
-earthengine authenticate
-```
-
-If your account requires an explicit project, pass it with `--ee-project`.
+No authentication is needed for the default source.
 
 ## Usage
 
-### Example 1: City center + radius
+### Example 1: Landsat NDVI (long timeline)
 
 ```bash
 python src/timelapse_tool.py \
@@ -56,21 +58,24 @@ python src/timelapse_tool.py \
   --export-frames
 ```
 
-### Example 2: Explicit bounding box
+### Example 2: Sentinel-2 false color
 
 ```bash
 python src/timelapse_tool.py \
   --bbox -74.10,40.60,-73.70,40.95 \
-  --start-year 2015 --end-year 2025 \
+  --start-year 2018 --end-year 2025 \
   --sensor sentinel2 \
   --viz false_color \
   --name nyc_s2 \
   --output-dir output
 ```
 
-### Optional MP4 output
+### Optional controls
 
-Add `--mp4` to also attempt MP4 writing (depends on local ffmpeg/imageio setup).
+- `--max-items-per-year` (default `120`): limit fetched items.
+- `--composite-items` (default `40`): number of least-cloudy scenes used in yearly composite.
+- `--stac-api`: override STAC endpoint.
+- `--mp4`: also write MP4 (if your local ffmpeg/imageio setup supports it).
 
 ## Output Structure
 
@@ -83,4 +88,4 @@ output/
     ...
 ```
 
-`metadata.json` stores the years, image counts, selected datasets, and frame statuses.
+`metadata.json` includes per-year item counts, selected band assets, normalization ranges, and errors (if any).
