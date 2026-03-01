@@ -54,7 +54,17 @@ class Config:
 
 
 def parse_args() -> argparse.Namespace:
-    """Define the CLI and return parsed arguments."""
+    """Define the CLI and return parsed arguments.
+    
+    Args:
+        None
+    
+    Returns:
+        argparse.Namespace: Parsed command-line arguments including lat, lon, radius-km,
+            bbox, start-year, end-year, sensor, viz, cloud-threshold, frame-size,
+            fps, output-dir, name, export-frames, mp4, stac-api, max-items-per-year,
+            and composite-items.
+    """
 
     parser = argparse.ArgumentParser(
         description="Generate a yearly satellite timelapse GIF from public STAC collections."
@@ -132,7 +142,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def latlon_radius_to_bbox(lat: float, lon: float, radius_km: float) -> tuple[float, float, float, float]:
-    """Approximate a square lon/lat bounding box around a center point."""
+    """Approximate a square lon/lat bounding box around a center point.
+    
+    Args:
+        lat (float): Latitude of the center point in degrees.
+        lon (float): Longitude of the center point in degrees.
+        radius_km (float): Radius around the center point in kilometers.
+    
+    Returns:
+        tuple[float, float, float, float]: Bounding box as (west, south, east, north) in degrees.
+    """
 
     lat_deg = radius_km / 110.574
     lon_deg = radius_km / (111.320 * max(math.cos(math.radians(lat)), 1e-6))
@@ -142,7 +161,17 @@ def latlon_radius_to_bbox(lat: float, lon: float, radius_km: float) -> tuple[flo
 
 
 def parse_bbox(bbox_str: str) -> tuple[float, float, float, float]:
-    """Parse a `west,south,east,north` string into numeric bounds."""
+    """Parse a `west,south,east,north` string into numeric bounds.
+    
+    Args:
+        bbox_str (str): Comma-separated bounding box string in format 'west,south,east,north'.
+    
+    Returns:
+        tuple[float, float, float, float]: Bounding box as (west, south, east, north) in degrees.
+    
+    Raises:
+        ValueError: If bbox format is invalid or bounds are logically incorrect.
+    """
 
     raw = [x.strip() for x in bbox_str.split(",")]
     if len(raw) != 4:
@@ -154,7 +183,17 @@ def parse_bbox(bbox_str: str) -> tuple[float, float, float, float]:
 
 
 def build_config(args: argparse.Namespace) -> Config:
-    """Validate CLI input and normalize it into a Config object."""
+    """Validate CLI input and normalize it into a Config object.
+    
+    Args:
+        args (argparse.Namespace): Parsed command-line arguments.
+    
+    Returns:
+        Config: Validated configuration dataclass with all required parameters.
+    
+    Raises:
+        ValueError: If any input validation check fails.
+    """
 
     if args.start_year > args.end_year:
         raise ValueError("start-year must be <= end-year")
@@ -206,7 +245,16 @@ def build_config(args: argparse.Namespace) -> Config:
 
 
 def query_items(config: Config, client: Client, year: int) -> list[Item]:
-    """Fetch and sort STAC items for one year by increasing cloud cover."""
+    """Fetch and sort STAC items for one year by increasing cloud cover.
+    
+    Args:
+        config (Config): Runtime configuration with sensor, cloud threshold, and bounding box.
+        client (Client): Authenticated STAC API client.
+        year (int): Year to query for imagery.
+    
+    Returns:
+        list[Item]: List of STAC Items sorted by cloud cover, limited to composite_items count.
+    """
 
     collection_id = SENSOR_TO_COLLECTION[config.sensor]
     start = f"{year}-01-01T00:00:00Z"
@@ -229,7 +277,15 @@ def query_items(config: Config, client: Client, year: int) -> list[Item]:
 
 
 def pick_band_key(items: list[Item], candidates: list[str]) -> str | None:
-    """Find the first asset key matching one of the requested band aliases."""
+    """Find the first asset key matching one of the requested band aliases.
+    
+    Args:
+        items (list[Item]): List of STAC Items to search (checks up to 10 items).
+        candidates (list[str]): List of band name aliases to match (case-insensitive).
+    
+    Returns:
+        str | None: The asset key name if found, None otherwise.
+    """
 
     lower_candidates = [c.lower() for c in candidates]
     for item in items[: min(len(items), 10)]:
@@ -249,7 +305,18 @@ def pick_band_key(items: list[Item], candidates: list[str]) -> str | None:
 
 
 def resolve_asset_keys(items: list[Item], sensor: str) -> dict[str, str]:
-    """Map logical band names (`blue/green/red/nir`) to collection asset keys."""
+    """Map logical band names (`blue/green/red/nir`) to collection asset keys.
+    
+    Args:
+        items (list[Item]): List of STAC Items from the target collection.
+        sensor (str): Sensor type ('sentinel2' or 'landsat') to determine band names.
+    
+    Returns:
+        dict[str, str]: Mapping of {'blue', 'green', 'red', 'nir'} to actual asset keys.
+    
+    Raises:
+        RuntimeError: If required RGB/NIR assets cannot be found in the collection.
+    """
 
     if sensor == "sentinel2":
         blue = pick_band_key(items, ["blue", "b02"])
@@ -268,7 +335,15 @@ def resolve_asset_keys(items: list[Item], sensor: str) -> dict[str, str]:
 
 
 def filter_items_with_assets(items: list[Item], asset_keys: dict[str, str]) -> list[Item]:
-    """Drop STAC items that do not expose every required band asset."""
+    """Drop STAC items that do not expose every required band asset.
+    
+    Args:
+        items (list[Item]): List of STAC Items to filter.
+        asset_keys (dict[str, str]): Mapping of band names to required asset keys.
+    
+    Returns:
+        list[Item]: Filtered list containing only items with all required assets.
+    """
 
     required = list(asset_keys.values())
     filtered = [item for item in items if all(k in item.assets for k in required)]
@@ -276,7 +351,16 @@ def filter_items_with_assets(items: list[Item], asset_keys: dict[str, str]) -> l
 
 
 def target_resolution_meters(bbox: tuple[float, float, float, float], frame_size: int, sensor: str) -> float:
-    """Estimate output pixel size in meters, respecting native sensor resolution."""
+    """Estimate output pixel size in meters, respecting native sensor resolution.
+    
+    Args:
+        bbox (tuple[float, float, float, float]): Bounding box as (west, south, east, north) in degrees.
+        frame_size (int): Target frame dimension in pixels.
+        sensor (str): Sensor type ('sentinel2' or 'landsat') to determine native resolution.
+    
+    Returns:
+        float: Target resolution in meters per pixel, respecting minimum native resolution.
+    """
 
     west, south, east, north = bbox
     lat_mid = (south + north) / 2
@@ -294,7 +378,20 @@ def fetch_year_composite(
     asset_keys: dict[str, str],
     resolution_m: float,
 ) -> np.ndarray:
-    """Read selected scenes, stack RGB+NIR bands, and build a yearly median composite."""
+    """Read selected scenes, stack RGB+NIR bands, and build a yearly median composite.
+    
+    Args:
+        config (Config): Runtime configuration with bounding box and projection settings.
+        items (list[Item]): List of STAC Items to composite.
+        asset_keys (dict[str, str]): Mapping of band names to asset keys.
+        resolution_m (float): Target resolution in meters per pixel.
+    
+    Returns:
+        np.ndarray: 4D array of shape (4, height, width) containing [blue, green, red, nir] bands.
+    
+    Raises:
+        RuntimeError: If no items have required assets or composite is empty/nodata.
+    """
 
     usable_items = filter_items_with_assets(items, asset_keys)
     if not usable_items:
@@ -326,7 +423,16 @@ def fetch_year_composite(
 
 
 def robust_min_max(values: np.ndarray, low_pct: float = 2.0, high_pct: float = 98.0) -> tuple[float, float]:
-    """Return percentile-based display bounds while ignoring nodata values."""
+    """Return percentile-based display bounds while ignoring nodata values.
+    
+    Args:
+        values (np.ndarray): Input array with potentially non-finite values.
+        low_pct (float): Lower percentile for minimum value (default: 2.0).
+        high_pct (float): Upper percentile for maximum value (default: 98.0).
+    
+    Returns:
+        tuple[float, float]: (min_value, max_value) for display normalization.
+    """
 
     finite = values[np.isfinite(values)]
     if finite.size == 0:
@@ -339,21 +445,46 @@ def robust_min_max(values: np.ndarray, low_pct: float = 2.0, high_pct: float = 9
 
 
 def normalize(values: np.ndarray, lo: float, hi: float) -> np.ndarray:
-    """Scale values into the `[0, 1]` display range and clamp outliers."""
+    """Scale values into the `[0, 1]` display range and clamp outliers.
+    
+    Args:
+        values (np.ndarray): Input array to normalize.
+        lo (float): Lower bound of the input range.
+        hi (float): Upper bound of the input range.
+    
+    Returns:
+        np.ndarray: Normalized array with values clipped to [0.0, 1.0].
+    """
 
     scaled = (values - lo) / (hi - lo)
     return np.clip(scaled, 0.0, 1.0)
 
 
 def hex_to_rgb(color: str) -> tuple[int, int, int]:
-    """Convert a hex color string into an RGB tuple."""
+    """Convert a hex color string into an RGB tuple.
+    
+    Args:
+        color (str): Hex color string in format '#RRGGBB' or 'RRGGBB'.
+    
+    Returns:
+        tuple[int, int, int]: RGB values as (red, green, blue) with range [0, 255].
+    """
 
     color = color.lstrip("#")
     return int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
 
 
 def ndvi_to_rgb(ndvi: np.ndarray, lo: float, hi: float) -> np.ndarray:
-    """Colorize NDVI values using a simple brown-to-green gradient."""
+    """Colorize NDVI values using a simple brown-to-green gradient.
+    
+    Args:
+        ndvi (np.ndarray): NDVI array with values typically in range [-1, 1].
+        lo (float): Lower bound of the NDVI range for color mapping.
+        hi (float): Upper bound of the NDVI range for color mapping.
+    
+    Returns:
+        np.ndarray: uint8 RGB image array of shape (height, width, 3).
+    """
 
     palette = [hex_to_rgb("#8c510a"), hex_to_rgb("#f6e8c3"), hex_to_rgb("#1b7837")]
     x = normalize(ndvi, lo, hi)
@@ -365,7 +496,15 @@ def ndvi_to_rgb(ndvi: np.ndarray, lo: float, hi: float) -> np.ndarray:
 
 
 def letterbox_to_square(frame: np.ndarray, size: int) -> np.ndarray:
-    """Resize a frame into a square canvas without distorting aspect ratio."""
+    """Resize a frame into a square canvas without distorting aspect ratio.
+    
+    Args:
+        frame (np.ndarray): Input RGB image array.
+        size (int): Target square dimension in pixels.
+    
+    Returns:
+        np.ndarray: uint8 RGB image padded/letterboxed to (size, size, 3).
+    """
 
     image = Image.fromarray(frame, mode="RGB")
     width, height = image.size
@@ -381,7 +520,15 @@ def letterbox_to_square(frame: np.ndarray, size: int) -> np.ndarray:
 
 
 def annotate_frame(frame: np.ndarray, year: int) -> np.ndarray:
-    """Overlay the frame year in the top-left corner."""
+    """Overlay the frame year in the top-left corner.
+    
+    Args:
+        frame (np.ndarray): Input RGB image array.
+        year (int): Year to display as text annotation.
+    
+    Returns:
+        np.ndarray: uint8 RGB image with year text overlaid.
+    """
 
     image = Image.fromarray(frame, mode="RGB").convert("RGBA")
     draw = ImageDraw.Draw(image, "RGBA")
@@ -399,7 +546,16 @@ def annotate_frame(frame: np.ndarray, year: int) -> np.ndarray:
 
 
 def make_placeholder_frame(year: int, frame_size: int, message: str) -> np.ndarray:
-    """Create a fallback frame when imagery is missing or processing fails."""
+    """Create a fallback frame when imagery is missing or processing fails.
+    
+    Args:
+        year (int): Year to display on the frame.
+        frame_size (int): Dimension for the square output image in pixels.
+        message (str): Error or status message to display.
+    
+    Returns:
+        np.ndarray: uint8 RGB image array of shape (frame_size, frame_size, 3).
+    """
 
     image = Image.new("RGB", (frame_size, frame_size), color=(30, 30, 30))
     draw = ImageDraw.Draw(image)
@@ -419,7 +575,15 @@ def make_placeholder_frame(year: int, frame_size: int, message: str) -> np.ndarr
 
 
 def compute_global_stats(composites: list[np.ndarray | None]) -> dict[str, tuple[float, float]]:
-    """Derive shared normalization ranges so all frames use a consistent scale."""
+    """Derive shared normalization ranges so all frames use a consistent scale.
+    
+    Args:
+        composites (list[np.ndarray | None]): List of yearly composite arrays or None if failed.
+            Each array has shape (4, height, width) with [blue, green, red, nir] bands.
+    
+    Returns:
+        dict[str, tuple[float, float]]: Normalization bounds for 'blue', 'green', 'red', 'nir', 'ndvi'.
+    """
 
     valid = [c for c in composites if c is not None]
     if not valid:
@@ -445,7 +609,16 @@ def compute_global_stats(composites: list[np.ndarray | None]) -> dict[str, tuple
 
 
 def render_composite(composite: np.ndarray, viz: str, stats: dict[str, tuple[float, float]]) -> np.ndarray:
-    """Render a composite into an RGB frame for the chosen visualization preset."""
+    """Render a composite into an RGB frame for the chosen visualization preset.
+    
+    Args:
+        composite (np.ndarray): Input array of shape (4, height, width) with [blue, green, red, nir].
+        viz (str): Visualization type ('true_color', 'false_color', or 'ndvi').
+        stats (dict[str, tuple[float, float]]): Normalization bounds for each band and NDVI.
+    
+    Returns:
+        np.ndarray: uint8 RGB image array of shape (height, width, 3).
+    """
 
     blue, green, red, nir = composite
     if viz == "true_color":
@@ -466,7 +639,14 @@ def render_composite(composite: np.ndarray, viz: str, stats: dict[str, tuple[flo
 
 
 def render_timelapse(config: Config) -> None:
-    """Run the full workflow: query imagery, build frames, and write outputs."""
+    """Run the full workflow: query imagery, build frames, and write outputs.
+    
+    Args:
+        config (Config): Runtime configuration with all user settings.
+    
+    Returns:
+        None. Writes GIF, optional PNG frames, optional MP4, and metadata.json to output directory.
+    """
 
     output_dir = config.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -568,7 +748,14 @@ def render_timelapse(config: Config) -> None:
 
 
 def main() -> None:
-    """CLI entry point."""
+    """CLI entry point.
+    
+    Args:
+        None (reads from sys.argv)
+    
+    Returns:
+        None. Initiates the full timelapse rendering pipeline.
+    """
 
     args = parse_args()
     try:
